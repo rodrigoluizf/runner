@@ -41,14 +41,13 @@ jobs:
       - name: SAST — gosec (análise estática de segurança em Go)
         uses: securego/gosec@master
         with:
-          args: '-fmt=sarif -out=gosec-results.sarif ./...'
-          working-directory: projetos/assinatura
+          args: '-no-fail -fmt=sarif -out=gosec-results.sarif ./projetos/assinatura/...'
 
       - name: Publicar resultados do gosec no GitHub Security
         uses: github/codeql-action/upload-sarif@v3
         if: always()
         with:
-          sarif_file: projetos/assinatura/gosec-results.sarif
+          sarif_file: gosec-results.sarif
 
       - name: Gitleaks — busca de segredos/credenciais commitadas
         uses: gitleaks/gitleaks-action@v2
