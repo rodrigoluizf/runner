@@ -1,0 +1,253 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+  packages: write
+  security-events: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/assinador
+
+jobs:
+
+
+  # JOB 1 — Verificação estática 
+
+  lint-and-sast:
+    name: Lint & SAST
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Configurar Go
+        uses: actions/setup-go@v5
+        with: { go-version: '1.24', cache: true }
+
+      - name: Lint do código Go
+        uses: golangci/golangci-lint-action@v6
+        with:
+          working-directory: projetos/assinatura
+          version: latest
+
+      - name: SAST — gosec (análise estática de segurança em Go)
+        uses: securego/gosec@master
+        with:
+          args: '-fmt=sarif -out=gosec-results.sarif ./...'
+          working-directory: projetos/assinatura
+
+      - name: Publicar resultados do gosec no GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: projetos/assinatura/gosec-results.sarif
+
+      - name: Gitleaks — busca de segredos/credenciais commitadas
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+
+  # JOB 2 — Testes unitários (Go)
+
+  test-go:
+    name: Testes Unitários (Go)
+    needs: lint-and-sast
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.24', cache: true }
+
+      - name: Baixar dependências
+        working-directory: projetos/assinatura
+        run: go mod download
+
+      - name: Rodar testes com cobertura
+        working-directory: projetos/assinatura
+        run: go test ./... -coverprofile=coverage.out -covermode=atomic
+
+      - name: Upload do relatório de cobertura
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-coverage
+          path: projetos/assinatura/coverage.out
+
+
+  # JOB 3 — Testes unitários (Java/Maven) do backend assinador.jar
+
+  test-java:
+    name: Testes Unitários (Java)
+    needs: lint-and-sast
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: 'temurin', java-version: '21', cache: 'maven' }
+
+      - name: Install SoftHSM2 (necessário para os testes de assinatura)
+        run: sudo apt-get install -y softhsm2
+
+      - name: Rodar testes Maven (JUnit 5)
+        working-directory: projetos/assinador-java
+        run: mvn -B test
+
+      - name: Upload do relatório de testes
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: java-test-results
+          path: projetos/assinador-java/target/surefire-reports/
+
+
+  # JOB 4 — Build do artefato imutável + Scanner de CVE na imagem
+
+  build-and-scan:
+    name: Build & Container Scan
+    needs: [ test-go, test-java ]
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Gerar tag imutável (SHA do commit)
+        id: meta
+        run: echo "tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Build da imagem Docker do backend (sem publicar ainda)
+        uses: docker/build-push-action@v6
+        with:
+          context: projetos/assinador-java
+          push: false
+          load: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
+
+      - name: Trivy — Scanner de CVE na imagem
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+
+      - name: Publicar resultado do Trivy no GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Login no GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publicar imagem no Registry (só se o scan passou)
+        uses: docker/build-push-action@v6
+        with:
+          context: projetos/assinador-java
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+  # JOB 5 — Deploy em STAGING (1º ambiente) + verificação dinâmica
+
+  deploy-staging:
+    name: Deploy em Staging
+    needs: build-and-scan
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+    steps:
+      - name: Login no GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Subir o container em Staging (porta 8081)
+        run: |
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-scan.outputs.image_tag }}
+          docker run -d --name assinador-staging -p 8081:8080 \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-scan.outputs.image_tag }}
+
+      - name: Verificação dinâmica — serviço está respondendo?
+        run: |
+          for i in $(seq 1 10); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8081 || echo "000")
+            if [ "$STATUS" != "000" ]; then
+              echo "Serviço respondendo em staging (HTTP $STATUS)"
+              exit 0
+            fi
+            echo "Aguardando serviço subir... tentativa $i"
+            sleep 3
+          done
+          echo "Serviço não respondeu em staging"
+          docker logs assinador-staging
+          exit 1
+
+      - name: Encerrar container de staging
+        if: always()
+        run: docker rm -f assinador-staging || true
+
+
+  # JOB 6 — Promoção para PRODUÇÃO (2º ambiente)
+
+  deploy-production:
+    name: Deploy em Produção
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+    steps:
+      - name: Login no GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Subir o container em Produção (porta 8080)
+        run: |
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-scan.outputs.image_tag }}
+          docker run -d --name assinador-producao -p 8080:8080 \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-scan.outputs.image_tag }}
+
+      - name: Verificação dinâmica pós-deploy
+        id: healthcheck
+        continue-on-error: true
+        run: |
+          for i in $(seq 1 10); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080 || echo "000")
+            if [ "$STATUS" != "000" ]; then
+              echo "Produção respondendo (HTTP $STATUS)"
+              exit 0
+            fi
+            sleep 3
+          done
+          docker logs assinador-producao
+          exit 1
+
+      - name: Rollback automático em caso de falha
+        if: steps.healthcheck.outcome == 'failure'
+        run: |
+          echo "Falha detectada — revertendo produção para a tag :latest anterior"
+          docker rm -f assinador-producao || true
+          docker run -d --name assinador-producao -p 8080:8080 \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          exit 1
