@@ -48,6 +48,6 @@ func init() {
 	signCmd.Flags().StringVar(&signContent, "content", "", "Conteúdo a ser assinado (obrigatório)")
 	signCmd.Flags().StringVar(&signToken, "token", "", "Token de autenticação (opcional)")
 	signCmd.Flags().BoolVar(&signLocal, "local", false, "Forçar invocação direta do assinador.jar (modo local)")
-	signCmd.MarkFlagRequired("content")
+	_ = signCmd.MarkFlagRequired("content")
 	rootCmd.AddCommand(signCmd)
 }
