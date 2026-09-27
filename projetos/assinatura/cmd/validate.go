@@ -47,7 +47,7 @@ func init() {
 	validateCmd.Flags().StringVar(&validateContent, "content", "", "Conteúdo original que foi assinado (obrigatório)")
 	validateCmd.Flags().StringVar(&validateSignature, "signature", "", "Assinatura a ser validada (obrigatório)")
 	validateCmd.Flags().BoolVar(&validateLocal, "local", false, "Forçar invocação direta do assinador.jar (modo local)")
-	validateCmd.MarkFlagRequired("content")
-	validateCmd.MarkFlagRequired("signature")
+	_ = validateCmd.MarkFlagRequired("content")
+	_ = validateCmd.MarkFlagRequired("signature")
 	rootCmd.AddCommand(validateCmd)
 }
