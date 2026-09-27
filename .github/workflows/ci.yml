@@ -1,0 +1,176 @@
+name: CI & Release
+
+on:
+  push:
+    branches: [ "main" ]
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  test-go:
+    name: Go Tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: projetos/assinatura
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache-dependency-path: projetos/assinatura/go.sum
+
+      - name: Download Dependencies
+        run: go mod download
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -v -short ./...
+
+  test-java:
+    name: Java Tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: projetos/assinador-java
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Install SoftHSM2
+        run: sudo apt-get install -y softhsm2
+
+      - name: Run Maven Tests
+        run: mvn -B test
+
+  build:
+    name: Build Multi-plataforma
+    needs: [test-go, test-java]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            ext: ""
+          - goos: windows
+            goarch: amd64
+            ext: ".exe"
+          - goos: darwin
+            goarch: amd64
+            ext: ""
+
+    defaults:
+      run:
+        working-directory: projetos/assinatura
+
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache-dependency-path: projetos/assinatura/go.sum
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3.5.0
+
+      - name: Download Dependencies
+        run: go mod download
+
+      - name: Extrair Versão
+        id: version
+        shell: bash
+        run: |
+          RAW_VERSION=$(grep -oP 'var version = "\K[^"]+' cmd/version.go)
+          VERSION="v$RAW_VERSION"
+          echo "RAW_VERSION=$RAW_VERSION" >> $GITHUB_ENV
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+          if git ls-remote --tags origin | grep -q "refs/tags/$VERSION"; then
+            echo "TAG_EXISTS=true" >> $GITHUB_ENV
+          else
+            echo "TAG_EXISTS=false" >> $GITHUB_ENV
+          fi
+
+      - name: Build assinatura
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go build -v -ldflags "-X github.com/kyriosdata/assinatura/cmd.version=${{ env.RAW_VERSION }}" -o assinatura-${{ env.VERSION }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} .
+
+      - name: Build simulador
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go build -v -ldflags "-X github.com/kyriosdata/assinatura/cmd.version=${{ env.RAW_VERSION }}" -o simulador-${{ env.VERSION }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} ./cmd/simulador/
+
+      - name: Checksum e Assinatura dos Artefatos
+        if: env.TAG_EXISTS == 'false'
+        shell: bash
+        run: |
+          for FILE in \
+            "assinatura-${{ env.VERSION }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}" \
+            "simulador-${{ env.VERSION }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}"; do
+            sha256sum "$FILE" > "$FILE.sha256"
+            cosign sign-blob --yes \
+              --output-certificate "$FILE.pem" \
+              --output-signature "$FILE.sig" \
+              "$FILE"
+          done
+
+      - name: Upload Artifact assinatura
+        uses: actions/upload-artifact@v4
+        with:
+          name: assinatura-${{ env.VERSION }}-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            projetos/assinatura/assinatura-${{ env.VERSION }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+            projetos/assinatura/assinatura-${{ env.VERSION }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}.sha256*
+            projetos/assinatura/assinatura-${{ env.VERSION }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}.pem*
+            projetos/assinatura/assinatura-${{ env.VERSION }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}.sig*
+          retention-days: 7
+
+      - name: Upload Artifact simulador
+        uses: actions/upload-artifact@v4
+        with:
+          name: simulador-${{ env.VERSION }}-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            projetos/assinatura/simulador-${{ env.VERSION }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+            projetos/assinatura/simulador-${{ env.VERSION }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}.sha256*
+            projetos/assinatura/simulador-${{ env.VERSION }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}.pem*
+            projetos/assinatura/simulador-${{ env.VERSION }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}.sig*
+          retention-days: 7
+
+      - name: Publicar GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: env.TAG_EXISTS == 'false'
+        with:
+          tag_name: ${{ env.VERSION }}
+          name: Release ${{ env.VERSION }}
+          generate_release_notes: true
+          files: |
+            projetos/assinatura/assinatura-${{ env.VERSION }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+            projetos/assinatura/assinatura-${{ env.VERSION }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}.sha256
+            projetos/assinatura/assinatura-${{ env.VERSION }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}.pem
+            projetos/assinatura/assinatura-${{ env.VERSION }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}.sig
+            projetos/assinatura/simulador-${{ env.VERSION }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+            projetos/assinatura/simulador-${{ env.VERSION }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}.sha256
+            projetos/assinatura/simulador-${{ env.VERSION }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}.pem
+            projetos/assinatura/simulador-${{ env.VERSION }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}.sig

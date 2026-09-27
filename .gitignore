@@ -1,0 +1,19 @@
+# Go
+/projetos/assinatura/assinatura
+/projetos/assinatura/assinatura-*
+*.exe
+
+# Java / Maven
+projetos/assinador-java/target/
+*.class
+*.jar
+!projetos/assinador-java/src/**/*.jar
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
