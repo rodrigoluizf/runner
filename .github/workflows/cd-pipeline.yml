@@ -208,7 +208,7 @@ jobs:
 
   deploy-production:
     name: Deploy em Produção
-        needs: [ deploy-staging, build-and-scan ]
+    needs: [ deploy-staging, build-and-scan ]
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
     environment:
